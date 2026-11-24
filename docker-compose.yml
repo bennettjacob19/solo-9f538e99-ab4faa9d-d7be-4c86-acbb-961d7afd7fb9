@@ -7,6 +7,8 @@ services:
     environment:
       # 每读一个块的模拟延迟（秒），0 表示最快
       READ_DELAY: "0.05"
+      # 每块默认写盘延迟（秒），0 表示最快；指定块可在页面表单按 块号:秒数 覆盖
+      WRITE_DELAY: "0"
       TAPE_ROOT: /data/tapes
       OUTPUT_ROOT: /data/output
     volumes:

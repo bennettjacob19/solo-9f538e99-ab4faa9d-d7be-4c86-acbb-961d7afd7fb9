@@ -51,7 +51,7 @@
 <body>
 <header>
   <h1>磁带灾备恢复演练（单机两带 · 4 KiB 镜像块）</h1>
-  <p>换带/回卷后从头顺读，跳过的块也算读量；镜像只按块号追加，每块写出前核对 SHA-256；坏块或额度不足即失败并保留上次成品。</p>
+  <p>读带与写盘流水线并行：换带/回卷后从头顺读，跳过的块也算读量；镜像只按块号追加，每块入暂存前与写出前各核对一次 SHA-256；坏块或额度不足即失败并保留上次成品。</p>
 </header>
 <main>
   <section class="card">
@@ -103,8 +103,14 @@
       <label for="staging_quota">暂存块数上限（提前读到的块）</label>
       <input id="staging_quota" name="staging_quota" type="number" min="0" max="12"
              value="{{ job.staging_quota or 12 }}" required {% if job.running %}disabled{% endif %}>
+      <label for="write_delays">每块写盘延迟（可选，格式 块号:秒数，逗号分隔）</label>
+      <input id="write_delays" name="write_delays" type="text"
+             placeholder="例如 0:1.5（块 0 写盘等待 1.5 秒，期间读带继续）"
+             value="{% for k, v in job.write_delays.items() %}{{ k }}:{{ v }}{% if not loop.last %},{% endif %}{% endfor %}"
+             {% if job.running %}disabled{% endif %}>
       <button type="submit" {% if job.running or not sets %}disabled{% endif %}>开始恢复演练</button>
-      <p class="hint">恢复期间页面每 1 秒自动刷新任务状态，下载上次成品不受影响。</p>
+      <p class="hint">恢复期间页面每 1 秒自动刷新任务状态，下载上次成品不受影响。
+        读带与写盘并行：写盘等待期间读到的帧计入“与写盘重叠的读帧”。</p>
     </form>
   </section>
 
@@ -127,10 +133,20 @@
       <div class="err">错误：{{ job.error }}（上次成品已保留，未被覆盖）</div>
     {% endif %}
 
+    {% if job.running and job.metrics %}
+    <h2 style="font-size:14px;margin-top:14px">实时指标（轮询刷新）</h2>
+    <div class="metrics">
+      <div class="metric"><b id="live-read">{{ job.metrics.blocks_read }}</b><span>实际读带块数</span></div>
+      <div class="metric"><b id="live-peak">{{ job.metrics.staging_peak }}</b><span>暂存峰值（块）</span></div>
+      <div class="metric"><b id="live-overlap">{{ job.metrics.overlapped_reads }}</b><span>与写盘重叠的读帧</span></div>
+    </div>
+    {% endif %}
+
     {% if job.result %}
     <div class="metrics">
       <div class="metric"><b>{{ job.result.metrics.blocks_read }}</b><span>实际读带块数</span></div>
       <div class="metric"><b>{{ job.result.metrics.staging_peak }}</b><span>暂存峰值（块）</span></div>
+      <div class="metric"><b>{{ job.result.metrics.overlapped_reads }}</b><span>与写盘重叠的读帧</span></div>
       <div class="metric"><b>{{ job.result.blocks_written }}</b><span>已写入镜像块</span></div>
       <div class="metric"><b>{{ job.result.metrics.tape_switches }}</b><span>换带次数</span></div>
       <div class="metric"><b>{{ job.result.metrics.rewinds }}</b><span>回卷次数</span></div>
@@ -153,6 +169,14 @@
     const job = await resp.json();
     const pre = document.getElementById("events");
     pre.textContent = (job.events || []).join("\n");
+    if (job.metrics) {
+      const read = document.getElementById("live-read");
+      const peak = document.getElementById("live-peak");
+      const overlap = document.getElementById("live-overlap");
+      if (read) read.textContent = job.metrics.blocks_read;
+      if (peak) peak.textContent = job.metrics.staging_peak;
+      if (overlap) overlap.textContent = job.metrics.overlapped_reads;
+    }
     if (!job.running) {
       clearInterval(pollTimer);
       setTimeout(() => window.location.reload(), 1200);

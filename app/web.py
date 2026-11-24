@@ -27,7 +27,14 @@ from flask import (
     url_for,
 )
 
-from .engine import FileImageSink, RecoveryResult, baseline, simulate_recovery
+from .engine import (
+    FileImageSink,
+    RecoveryMetrics,
+    RecoveryResult,
+    baseline,
+    parse_write_delays,
+    simulate_recovery,
+)
 from .storage import ManifestError, discover_sets, load_set
 
 ARTIFACT_NAME = "image.bin"
@@ -40,9 +47,11 @@ class JobState:
     set_name: str | None = None
     read_quota: int = 0
     staging_quota: int = 0
+    write_delays: dict[str, float] = field(default_factory=dict)
     started_at: float = 0.0
     finished_at: float = 0.0
     result: dict[str, Any] | None = None
+    metrics: dict[str, Any] | None = None
     events: list[str] = field(default_factory=list)
     error: str | None = None
 
@@ -51,12 +60,15 @@ def create_app(
     tape_root: str | None = None,
     output_root: str | None = None,
     read_delay: float | None = None,
+    write_delay: float | None = None,
 ) -> Flask:
     app = Flask(__name__)
     tape_root = tape_root or os.environ.get("TAPE_ROOT", "data/tapes")
     output_root = output_root or os.environ.get("OUTPUT_ROOT", "data/output")
     if read_delay is None:
         read_delay = float(os.environ.get("READ_DELAY", "0.05"))
+    if write_delay is None:
+        write_delay = float(os.environ.get("WRITE_DELAY", "0"))
     os.makedirs(output_root, exist_ok=True)
 
     lock = threading.Lock()
@@ -72,7 +84,26 @@ def create_app(
         path = artifact_path(set_name)
         return os.path.getsize(path) if os.path.isfile(path) else 0
 
-    def run_recovery(set_name: str, read_quota: int, staging_quota: int) -> None:
+    def _live_metrics(metrics: RecoveryMetrics) -> None:
+        """引擎在持锁状态外调用：把最新指标快照发布到任务状态供页面轮询。"""
+        with lock:
+            state.metrics = {
+                "blocks_read": metrics.blocks_read,
+                "staging_peak": metrics.staging_peak,
+                "overlapped_reads": metrics.overlapped_reads,
+                "tape_switches": metrics.tape_switches,
+                "rewinds": metrics.rewinds,
+                "tape_mounts": metrics.tape_mounts,
+                "bad_block": metrics.bad_block,
+            }
+            state.events = list(metrics.events[-MAX_EVENTS:])
+
+    def run_recovery(
+        set_name: str,
+        read_quota: int,
+        staging_quota: int,
+        per_block_write_delays: dict[int, float],
+    ) -> None:
         nonlocal state
         out_dir = os.path.join(output_root, set_name)
         os.makedirs(out_dir, exist_ok=True)
@@ -90,7 +121,10 @@ def create_app(
                 staging_quota,
                 sink=sink,
                 read_delay=read_delay,
+                write_delay=write_delay,
+                write_delays=per_block_write_delays,
                 sleep=on_sleep,
+                progress=_live_metrics,
             )
             with lock:
                 state.events = list(result.metrics.events[-MAX_EVENTS:])
@@ -103,10 +137,13 @@ def create_app(
                     if os.path.exists(tmp_path):
                         os.remove(tmp_path)
                 state.result = _result_to_dict(result)
+                state.metrics = state.result["metrics"]
                 state.error = result.error
         except Exception as exc:  # noqa: BLE001 - 线程内兜底，错误回传页面
             with lock:
                 state.error = f"恢复任务异常: {exc}"
+                state.result = None
+                state.metrics = None
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
         finally:
@@ -145,7 +182,9 @@ def create_app(
                 "set_name": state.set_name,
                 "read_quota": state.read_quota,
                 "staging_quota": state.staging_quota,
+                "write_delays": state.write_delays,
                 "result": state.result,
+                "metrics": state.metrics,
                 "error": state.error,
                 "events": list(state.events),
             }
@@ -162,9 +201,17 @@ def create_app(
         if read_quota <= 0 or staging_quota < 0:
             abort(400, "读带额度必须为正整数，暂存额度必须为非负整数")
         try:
+            per_block_write_delays = parse_write_delays(
+                request.form.get("write_delays", "").strip() or None
+            )
+        except ValueError as exc:
+            abort(400, str(exc))
+        try:
             tape_set = load_set(tape_root, set_name)
         except ManifestError as exc:
             abort(400, str(exc))
+        if any(index >= tape_set.block_count for index in per_block_write_delays):
+            abort(400, "写盘延迟配置中的块号超出该带卷的镜像块数")
 
         with lock:
             if state.running:
@@ -173,15 +220,19 @@ def create_app(
             state.set_name = tape_set.name
             state.read_quota = read_quota
             state.staging_quota = staging_quota
+            state.write_delays = {
+                str(index): delay for index, delay in per_block_write_delays.items()
+            }
             state.started_at = time.time()
             state.finished_at = 0.0
             state.result = None
+            state.metrics = None
             state.events = ["任务已提交，开始恢复演练…"]
             state.error = None
 
         thread = threading.Thread(
             target=run_recovery,
-            args=(tape_set.name, read_quota, staging_quota),
+            args=(tape_set.name, read_quota, staging_quota, per_block_write_delays),
             daemon=True,
         )
         thread.start()
@@ -195,7 +246,9 @@ def create_app(
                 "set_name": state.set_name,
                 "read_quota": state.read_quota,
                 "staging_quota": state.staging_quota,
+                "write_delays": state.write_delays,
                 "result": state.result,
+                "metrics": state.metrics,
                 "error": state.error,
                 "events": list(state.events),
             }

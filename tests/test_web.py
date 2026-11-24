@@ -204,6 +204,98 @@ class WebTests(unittest.TestCase):
         self.assertEqual(st["result"]["metrics"]["blocks_read"], 12)
         self.assertEqual(st["result"]["metrics"]["staging_peak"], 10)
 
+    def test_write_delay_overlap_end_to_end(self):
+        # 块 0 写盘慢、暂存 1 块：读带必须在块 0 写完前继续，
+        # 完成后实读量不变，且存在与写盘重叠的读帧。
+        self.client.post(
+            "/recover",
+            data={
+                "set_name": "ordered",
+                "read_quota": 12,
+                "staging_quota": 1,
+                "write_delays": "0:0.4",
+            },
+        )
+        st = self._wait_done(timeout=30)
+        self.assertTrue(st["result"]["success"], st["error"])
+        metrics = st["result"]["metrics"]
+        self.assertEqual(metrics["blocks_read"], 12)
+        self.assertEqual(metrics["staging_peak"], 1)
+        self.assertGreaterEqual(metrics["overlapped_reads"], 1)
+
+        # 运行期间 /status 暴露实时指标。
+        slow = create_app(
+            tape_root=self.tapes,
+            output_root=self.output,
+            read_delay=0.05,
+            write_delay=0.0,
+        )
+        client = slow.test_client()
+        client.post(
+            "/recover",
+            data={
+                "set_name": "ordered",
+                "read_quota": 12,
+                "staging_quota": 1,
+                "write_delays": "0:1.0",
+            },
+        )
+        saw_live_metrics = False
+        for _ in range(60):
+            status = client.get("/status").get_json()
+            if status["running"] and status["metrics"]:
+                self.assertIn("blocks_read", status["metrics"])
+                self.assertIn("staging_peak", status["metrics"])
+                self.assertIn("overlapped_reads", status["metrics"])
+                saw_live_metrics = True
+                break
+            time.sleep(0.02)
+        self.assertTrue(saw_live_metrics, "未观察到运行中的实时指标")
+        for _ in range(150):
+            if not client.get("/status").get_json()["running"]:
+                break
+            time.sleep(0.02)
+
+    def test_invalid_write_delays_rejected(self):
+        resp = self.client.post(
+            "/recover",
+            data={
+                "set_name": "ordered",
+                "read_quota": 12,
+                "staging_quota": 1,
+                "write_delays": "0:not-a-number",
+            },
+        )
+        self.assertEqual(resp.status_code, 400)
+
+        resp = self.client.post(
+            "/recover",
+            data={
+                "set_name": "ordered",
+                "read_quota": 12,
+                "staging_quota": 1,
+                "write_delays": "99:0.1",
+            },
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_next_job_accepted_after_failure_settles(self):
+        # 一侧失败、两侧停稳后必须能接下一单（状态被复位）。
+        self.client.post(
+            "/recover",
+            data={"set_name": "bad", "read_quota": 100, "staging_quota": 12},
+        )
+        failed = self._wait_done()
+        self.assertFalse(failed["result"]["success"])
+
+        self.client.post(
+            "/recover",
+            data={"set_name": "ordered", "read_quota": 12, "staging_quota": 0},
+        )
+        ok = self._wait_done()
+        self.assertTrue(ok["result"]["success"], ok["error"])
+        self.assertEqual(ok["result"]["metrics"]["blocks_read"], 12)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
